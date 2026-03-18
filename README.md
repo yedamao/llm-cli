@@ -2,6 +2,12 @@
 
 Small Go command line client for OpenAI-compatible APIs.
 
+## Install
+
+```bash
+go install github.com/yedamao/llm-cli@latest
+```
+
 ## Config
 
 `llm-cli` reads configuration from either environment variables or a dot config file in your home directory:
