@@ -1,6 +1,6 @@
 # llm-cli
 
-Small Go command line client for OpenAI-compatible APIs.
+Small command line client for OpenAI-compatible APIs.
 
 ## Install
 
