@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -20,6 +21,8 @@ const (
 	defaultTimeout        = 60 * time.Second
 )
 
+var httpClient = http.DefaultClient
+
 type Config struct {
 	BaseURL string `json:"BASE_URL"`
 	APIKey  string `json:"API_KEY"`
@@ -29,6 +32,7 @@ type Config struct {
 type chatRequest struct {
 	Model    string        `json:"model"`
 	Messages []chatMessage `json:"messages"`
+	Stream   bool          `json:"stream"`
 }
 
 type chatMessage struct {
@@ -44,6 +48,17 @@ type chatResponse struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
 		Code    any    `json:"code"`
+	} `json:"error"`
+}
+
+type streamResponse struct {
+	Choices []struct {
+		Delta struct {
+			Content string `json:"content"`
+		} `json:"delta"`
+	} `json:"choices"`
+	Error *struct {
+		Message string `json:"message"`
 	} `json:"error"`
 }
 
@@ -73,13 +88,7 @@ func run() error {
 		return err
 	}
 
-	resp, err := callChatCompletion(context.Background(), cfg, prompt)
-	if err != nil {
-		return err
-	}
-
-	fmt.Println(resp)
-	return nil
+	return streamChatCompletion(context.Background(), cfg, prompt, os.Stdout)
 }
 
 func printUsage() {
@@ -172,17 +181,18 @@ func readPrompt(args []string, stdin io.Reader) (string, error) {
 	return prompt, nil
 }
 
-func callChatCompletion(ctx context.Context, cfg Config, prompt string) (string, error) {
+func streamChatCompletion(ctx context.Context, cfg Config, prompt string, output io.Writer) error {
 	reqBody := chatRequest{
 		Model: cfg.Model,
 		Messages: []chatMessage{
 			{Role: "user", Content: prompt},
 		},
+		Stream: true,
 	}
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", fmt.Errorf("encode request: %w", err)
+		return fmt.Errorf("encode request: %w", err)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, defaultTimeout)
@@ -191,43 +201,96 @@ func callChatCompletion(ctx context.Context, cfg Config, prompt string) (string,
 	url := cfg.BaseURL + "/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return "", fmt.Errorf("build request: %w", err)
+		return fmt.Errorf("build request: %w", err)
 	}
 
 	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("request %s: %w", url, err)
+		return fmt.Errorf("request %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("read response: %w", err)
-	}
-
-	var payload chatResponse
-	if err := json.Unmarshal(respBody, &payload); err != nil {
-		return "", fmt.Errorf("decode response: %w", err)
-	}
-
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if payload.Error != nil && payload.Error.Message != "" {
-			return "", fmt.Errorf("api error (%d): %s", resp.StatusCode, payload.Error.Message)
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("read error response: %w", err)
 		}
-		return "", fmt.Errorf("api error (%d)", resp.StatusCode)
+
+		var payload chatResponse
+		if err := json.Unmarshal(respBody, &payload); err == nil {
+			if payload.Error != nil && payload.Error.Message != "" {
+				return fmt.Errorf("api error (%d): %s", resp.StatusCode, payload.Error.Message)
+			}
+		}
+
+		return fmt.Errorf("api error (%d)", resp.StatusCode)
 	}
 
-	if len(payload.Choices) == 0 {
-		return "", errors.New("api returned no choices")
+	if err := streamSSE(resp.Body, output); err != nil {
+		return err
 	}
 
-	content := strings.TrimSpace(payload.Choices[0].Message.Content)
-	if content == "" {
-		return "", errors.New("api returned empty content")
+	_, err = fmt.Fprintln(output)
+	return err
+}
+
+func streamSSE(input io.Reader, output io.Writer) error {
+	scanner := bufio.NewScanner(input)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	var wroteContent bool
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "[DONE]" {
+			if !wroteContent {
+				return errors.New("api returned no streamed content")
+			}
+			return nil
+		}
+
+		var chunk streamResponse
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			return fmt.Errorf("decode stream chunk: %w", err)
+		}
+
+		if chunk.Error != nil && chunk.Error.Message != "" {
+			return fmt.Errorf("api error: %s", chunk.Error.Message)
+		}
+
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+
+		content := chunk.Choices[0].Delta.Content
+		if content == "" {
+			continue
+		}
+
+		if _, err := io.WriteString(output, content); err != nil {
+			return fmt.Errorf("write output: %w", err)
+		}
+		wroteContent = true
 	}
 
-	return content, nil
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read stream: %w", err)
+	}
+
+	if !wroteContent {
+		return errors.New("api returned no streamed content")
+	}
+
+	return nil
 }

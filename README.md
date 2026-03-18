@@ -1,6 +1,7 @@
 # llm-cli
 
 Small Go command line client for OpenAI-compatible APIs.
+Responses are streamed to stdout as tokens arrive.
 
 ## Install
 
