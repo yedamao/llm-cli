@@ -12,13 +12,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 )
 
 const (
 	defaultConfigFileName = ".llm-cli.json"
 	defaultBaseURL        = "https://api.openai.com/v1"
-	defaultTimeout        = 60 * time.Second
 )
 
 var httpClient = http.DefaultClient
@@ -194,9 +192,6 @@ func streamChatCompletion(ctx context.Context, cfg Config, prompt string, output
 	if err != nil {
 		return fmt.Errorf("encode request: %w", err)
 	}
-
-	ctx, cancel := context.WithTimeout(ctx, defaultTimeout)
-	defer cancel()
 
 	url := cfg.BaseURL + "/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
