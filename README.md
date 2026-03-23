@@ -35,7 +35,24 @@ Create `~/.llm-cli.json`:
 ```bash
 llm-cli "Write a haiku about Go"
 echo "Summarize this text" | llm-cli
+llm-cli
 ```
+
+Running `llm-cli` with no arguments in a terminal starts an interactive chat loop with line editing and history. Each new prompt includes the earlier conversation, so follow-up questions work as expected.
+
+Example:
+
+```text
+$ llm-cli
+> Explain Go interfaces simply
+Interfaces define behavior through method sets.
+> Show a short example
+type Reader interface {
+    Read(p []byte) (n int, err error)
+}
+```
+
+Press `Ctrl+D` to exit. `Ctrl+C` aborts the current prompt.
 
 For OpenAI-compatible providers, `BASE_URL` should point at the provider's `/v1` root. The CLI sends requests to:
 

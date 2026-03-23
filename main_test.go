@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -115,12 +117,141 @@ func TestStreamChatCompletion(t *testing.T) {
 	}
 
 	var output strings.Builder
-	if err := streamChatCompletion(context.Background(), cfg, "hello", &output); err != nil {
+	reply, err := streamChatCompletion(context.Background(), cfg, []chatMessage{
+		{Role: "user", Content: "hello"},
+	}, &output)
+	if err != nil {
 		t.Fatalf("streamChatCompletion() error = %v", err)
 	}
 
+	if reply != "Hi there" {
+		t.Fatalf("reply = %q", reply)
+	}
 	if output.String() != "Hi there\n" {
 		t.Fatalf("output = %q", output.String())
+	}
+}
+
+func TestShouldStartLoop(t *testing.T) {
+	if shouldStartLoop([]string{"hello"}) {
+		t.Fatalf("shouldStartLoop() = true with args")
+	}
+}
+
+func TestInteractiveLoopMaintainsConversation(t *testing.T) {
+	t.Cleanup(func() {
+		httpClient = http.DefaultClient
+	})
+
+	var requests []chatRequest
+	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+
+		var req chatRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		requests = append(requests, req)
+
+		reply := "First reply"
+		if len(req.Messages) > 1 {
+			reply = "Second reply"
+		}
+
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader(
+				`data: {"choices":[{"delta":{"content":"` + reply + `"}}]}` + "\n\n" +
+					"data: [DONE]\n\n",
+			)),
+		}, nil
+	})}
+
+	cfg := Config{
+		BaseURL: "https://example.test/v1",
+		APIKey:  "test-key",
+		Model:   "test-model",
+	}
+
+	editor := &fakeLineEditor{
+		prompts: []promptResult{
+			{line: "hello"},
+			{line: "follow up"},
+			{err: io.EOF},
+		},
+	}
+
+	var output strings.Builder
+	if err := interactiveLoop(context.Background(), cfg, editor, &output); err != nil {
+		t.Fatalf("interactiveLoop() error = %v", err)
+	}
+
+	if got, want := editor.history, []string{"hello", "follow up"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("history = %#v, want %#v", got, want)
+	}
+
+	if len(requests) != 2 {
+		t.Fatalf("requests = %d", len(requests))
+	}
+
+	if len(requests[0].Messages) != 1 {
+		t.Fatalf("first request messages = %+v", requests[0].Messages)
+	}
+
+	wantSecond := []chatMessage{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: "First reply"},
+		{Role: "user", Content: "follow up"},
+	}
+	if !reflect.DeepEqual(requests[1].Messages, wantSecond) {
+		t.Fatalf("second request messages = %#v, want %#v", requests[1].Messages, wantSecond)
+	}
+
+	if output.String() != "First reply\nSecond reply\n\n" {
+		t.Fatalf("output = %q", output.String())
+	}
+}
+
+type fakeLineEditor struct {
+	prompts []promptResult
+	history []string
+}
+
+type promptResult struct {
+	line string
+	err  error
+}
+
+func (f *fakeLineEditor) Prompt(string) (string, error) {
+	if len(f.prompts) == 0 {
+		return "", io.EOF
+	}
+
+	next := f.prompts[0]
+	f.prompts = f.prompts[1:]
+	return next.line, next.err
+}
+
+func (f *fakeLineEditor) AppendHistory(line string) {
+	f.history = append(f.history, line)
+}
+
+func (f *fakeLineEditor) Close() error {
+	return nil
+}
+
+func TestInteractiveLoopReturnsPromptError(t *testing.T) {
+	editor := &fakeLineEditor{
+		prompts: []promptResult{{err: errors.New("boom")}},
+	}
+
+	err := interactiveLoop(context.Background(), Config{}, editor, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "read prompt: boom") {
+		t.Fatalf("interactiveLoop() error = %v", err)
 	}
 }
 
