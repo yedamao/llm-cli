@@ -13,7 +13,11 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/peterh/liner"
+	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 const (
@@ -62,6 +66,70 @@ type streamResponse struct {
 	} `json:"error"`
 }
 
+type streamRunner func(context.Context, Config, []chatMessage, func(string) error) (string, error)
+
+type transcriptEntry struct {
+	role    string
+	content string
+}
+
+type streamChunkMsg struct {
+	content string
+}
+
+type streamDoneMsg struct {
+	reply string
+}
+
+type streamErrMsg struct {
+	err error
+}
+
+type chatModel struct {
+	cfg          Config
+	width        int
+	height       int
+	ready        bool
+	inFlight     bool
+	errMsg       string
+	conversation []chatMessage
+	transcript   []transcriptEntry
+	viewport     viewport.Model
+	textarea     textarea.Model
+	spinner      spinner.Model
+	cancel       context.CancelFunc
+	streamCh     <-chan tea.Msg
+	streamRunner streamRunner
+}
+
+var (
+	appStyle = lipgloss.NewStyle().Padding(1, 2)
+
+	headerStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("86")).
+			MarginBottom(1)
+
+	userStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("39"))
+
+	assistantStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("205"))
+
+	statusStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("243"))
+
+	errorStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("196")).
+			MarginTop(1)
+
+	helpStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("241")).
+			MarginTop(1)
+)
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -84,7 +152,7 @@ func run() error {
 	}
 
 	if shouldStartLoop(os.Args[1:]) {
-		return runInteractiveLoop(context.Background(), cfg, os.Stdout)
+		return runInteractiveLoop(cfg)
 	}
 
 	prompt, err := readPrompt(os.Args[1:], os.Stdin)
@@ -94,7 +162,15 @@ func run() error {
 
 	_, err = streamChatCompletion(context.Background(), cfg, []chatMessage{
 		{Role: "user", Content: prompt},
-	}, os.Stdout)
+	}, func(chunk string) error {
+		_, writeErr := io.WriteString(os.Stdout, chunk)
+		return writeErr
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = fmt.Fprintln(os.Stdout)
 	return err
 }
 
@@ -202,7 +278,7 @@ func readPrompt(args []string, stdin io.Reader) (string, error) {
 	return prompt, nil
 }
 
-func streamChatCompletion(ctx context.Context, cfg Config, messages []chatMessage, output io.Writer) (string, error) {
+func streamChatCompletion(ctx context.Context, cfg Config, messages []chatMessage, onChunk func(string) error) (string, error) {
 	reqBody := chatRequest{
 		Model:    cfg.Model,
 		Messages: messages,
@@ -246,18 +322,17 @@ func streamChatCompletion(ctx context.Context, cfg Config, messages []chatMessag
 	}
 
 	var captured strings.Builder
-	if err := streamSSE(resp.Body, io.MultiWriter(output, &captured)); err != nil {
-		return "", err
-	}
-
-	if _, err := fmt.Fprintln(output); err != nil {
+	if err := streamSSE(resp.Body, func(chunk string) error {
+		captured.WriteString(chunk)
+		return onChunk(chunk)
+	}); err != nil {
 		return "", err
 	}
 
 	return captured.String(), nil
 }
 
-func streamSSE(input io.Reader, output io.Writer) error {
+func streamSSE(input io.Reader, onChunk func(string) error) error {
 	scanner := bufio.NewScanner(input)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
@@ -298,7 +373,7 @@ func streamSSE(input io.Reader, output io.Writer) error {
 			continue
 		}
 
-		if _, err := io.WriteString(output, content); err != nil {
+		if err := onChunk(content); err != nil {
 			return fmt.Errorf("write output: %w", err)
 		}
 		wroteContent = true
@@ -315,46 +390,241 @@ func streamSSE(input io.Reader, output io.Writer) error {
 	return nil
 }
 
-type lineEditor interface {
-	Prompt(string) (string, error)
-	AppendHistory(string)
-	Close() error
+func runInteractiveLoop(cfg Config) error {
+	p := tea.NewProgram(newChatModel(cfg, streamChatCompletion), tea.WithAltScreen())
+	_, err := p.Run()
+	return err
 }
 
-func runInteractiveLoop(ctx context.Context, cfg Config, output io.Writer) error {
-	editor := liner.NewLiner()
-	editor.SetCtrlCAborts(true)
-	defer editor.Close()
+func newChatModel(cfg Config, runner streamRunner) chatModel {
+	ta := textarea.New()
+	ta.Placeholder = "Ask something..."
+	ta.Focus()
+	ta.Prompt = "┃ "
+	ta.CharLimit = 0
+	ta.SetHeight(3)
+	ta.ShowLineNumbers = false
 
-	return interactiveLoop(ctx, cfg, editor, output)
+	vp := viewport.New(0, 0)
+	vp.SetContent("")
+
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+
+	m := chatModel{
+		cfg:          cfg,
+		textarea:     ta,
+		viewport:     vp,
+		spinner:      sp,
+		streamRunner: runner,
+		transcript: []transcriptEntry{
+			{role: "assistant", content: "Ready. Type a prompt and press Enter. Use Shift+Enter for a newline."},
+		},
+	}
+	m.refreshViewport()
+	return m
 }
 
-func interactiveLoop(ctx context.Context, cfg Config, editor lineEditor, output io.Writer) error {
-	history := make([]chatMessage, 0, 16)
+func (m chatModel) Init() tea.Cmd {
+	return textarea.Blink
+}
 
-	for {
-		line, err := editor.Prompt("> ")
-		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, liner.ErrPromptAborted) {
-				_, writeErr := fmt.Fprintln(output)
-				return writeErr
+func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		return m.handleWindowSize(msg), nil
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "esc":
+			if m.cancel != nil {
+				m.cancel()
 			}
-			return fmt.Errorf("read prompt: %w", err)
+			return m, tea.Quit
+		case "ctrl+l":
+			m.transcript = nil
+			m.errMsg = ""
+			m.refreshViewport()
+			return m, nil
+		case "enter":
+			if m.inFlight {
+				return m, nil
+			}
+			return m.submitPrompt()
 		}
+	case spinner.TickMsg:
+		if m.inFlight {
+			var cmd tea.Cmd
+			m.spinner, cmd = m.spinner.Update(msg)
+			return m, cmd
+		}
+	case streamChunkMsg:
+		m.errMsg = ""
+		m.appendAssistantChunk(msg.content)
+		m.refreshViewport()
+		return m, waitForStreamMsg(m.streamCh)
+	case streamDoneMsg:
+		m.inFlight = false
+		m.conversation = append(m.conversation, chatMessage{Role: "assistant", Content: msg.reply})
+		m.cancel = nil
+		m.streamCh = nil
+		m.errMsg = ""
+		m.refreshViewport()
+		return m, nil
+	case streamErrMsg:
+		m.inFlight = false
+		m.cancel = nil
+		m.streamCh = nil
+		m.errMsg = msg.err.Error()
+		m.refreshViewport()
+		return m, nil
+	}
 
-		prompt := strings.TrimSpace(line)
-		if prompt == "" {
+	var cmd tea.Cmd
+	m.textarea, cmd = m.textarea.Update(msg)
+	return m, cmd
+}
+
+func (m chatModel) View() string {
+	if !m.ready {
+		return "\n  Loading..."
+	}
+
+	header := headerStyle.Render("llm-cli")
+	status := statusStyle.Render("Model: " + m.cfg.Model)
+	if m.inFlight {
+		status = statusStyle.Render(m.spinner.View() + " Streaming from " + m.cfg.Model)
+	}
+
+	input := m.textarea.View()
+	help := helpStyle.Render("Enter send • Shift+Enter newline • Ctrl+L clear transcript • Esc quit")
+
+	parts := []string{
+		header,
+		status,
+		m.viewport.View(),
+		input,
+		help,
+	}
+	if m.errMsg != "" {
+		parts = append(parts, errorStyle.Render("Error: "+m.errMsg))
+	}
+
+	return appStyle.Width(m.width).Height(m.height).Render(strings.Join(parts, "\n"))
+}
+
+func (m chatModel) handleWindowSize(msg tea.WindowSizeMsg) chatModel {
+	m.width = msg.Width
+	m.height = msg.Height
+	m.ready = true
+
+	contentWidth := max(20, msg.Width-4)
+	headerHeight := 1
+	statusHeight := 1
+	inputHeight := 4
+	helpHeight := 1
+	errorHeight := 0
+	if m.errMsg != "" {
+		errorHeight = 2
+	}
+
+	viewportHeight := msg.Height - (headerHeight + statusHeight + inputHeight + helpHeight + errorHeight + 4)
+	if viewportHeight < 5 {
+		viewportHeight = 5
+	}
+
+	m.viewport.Width = contentWidth
+	m.viewport.Height = viewportHeight
+	m.textarea.SetWidth(contentWidth)
+	m.refreshViewport()
+	return m
+}
+
+func (m chatModel) submitPrompt() (chatModel, tea.Cmd) {
+	prompt := strings.TrimSpace(m.textarea.Value())
+	if prompt == "" {
+		return m, nil
+	}
+
+	m.errMsg = ""
+	m.inFlight = true
+	m.transcript = append(m.transcript,
+		transcriptEntry{role: "user", content: prompt},
+		transcriptEntry{role: "assistant", content: ""},
+	)
+	m.conversation = append(m.conversation, chatMessage{Role: "user", Content: prompt})
+	m.textarea.Reset()
+	m.refreshViewport()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancel = cancel
+	chatCopy := append([]chatMessage(nil), m.conversation...)
+	ch := m.startStream(ctx, chatCopy)
+	m.streamCh = ch
+
+	return m, tea.Batch(m.spinner.Tick, waitForStreamMsg(ch))
+}
+
+func (m *chatModel) appendAssistantChunk(chunk string) {
+	for i := len(m.transcript) - 1; i >= 0; i-- {
+		if m.transcript[i].role == "assistant" {
+			m.transcript[i].content += chunk
+			return
+		}
+	}
+	m.transcript = append(m.transcript, transcriptEntry{role: "assistant", content: chunk})
+}
+
+func (m *chatModel) refreshViewport() {
+	var sections []string
+	for _, entry := range m.transcript {
+		if strings.TrimSpace(entry.content) == "" && entry.role == "assistant" && m.inFlight {
+			sections = append(sections, assistantStyle.Render("Assistant"), "")
 			continue
 		}
 
-		editor.AppendHistory(prompt)
-		history = append(history, chatMessage{Role: "user", Content: prompt})
-
-		reply, err := streamChatCompletion(ctx, cfg, history, output)
-		if err != nil {
-			return err
+		label := assistantStyle.Render("Assistant")
+		if entry.role == "user" {
+			label = userStyle.Render("You")
 		}
 
-		history = append(history, chatMessage{Role: "assistant", Content: reply})
+		sections = append(sections, label, entry.content)
 	}
+
+	m.viewport.SetContent(strings.Join(sections, "\n\n"))
+	m.viewport.GotoBottom()
+}
+
+func (m chatModel) startStream(ctx context.Context, messages []chatMessage) <-chan tea.Msg {
+	ch := make(chan tea.Msg, 32)
+
+	go func() {
+		reply, err := m.streamRunner(ctx, m.cfg, messages, func(chunk string) error {
+			ch <- streamChunkMsg{content: chunk}
+			return nil
+		})
+		if err != nil {
+			ch <- streamErrMsg{err: err}
+			return
+		}
+		ch <- streamDoneMsg{reply: reply}
+	}()
+
+	return ch
+}
+
+func waitForStreamMsg(ch <-chan tea.Msg) tea.Cmd {
+	if ch == nil {
+		return nil
+	}
+
+	return func() tea.Msg {
+		return <-ch
+	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
