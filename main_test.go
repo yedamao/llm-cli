@@ -197,6 +197,110 @@ func TestChatModelMaintainsConversation(t *testing.T) {
 	}
 }
 
+func TestChatModelAltEnterInsertsNewlineWithoutSubmitting(t *testing.T) {
+	m := newChatModel(Config{Model: "test-model"}, func(context.Context, Config, []chatMessage, func(string) error) (string, error) {
+		return "", nil
+	})
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = model.(chatModel)
+
+	m.textarea.SetValue("hello")
+	model, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter, Alt: true})
+	m = model.(chatModel)
+
+	if got := m.textarea.Value(); got != "hello\n" {
+		t.Fatalf("textarea value = %q", got)
+	}
+	if m.inFlight {
+		t.Fatalf("expected prompt not to submit")
+	}
+	if len(m.conversation) != 0 {
+		t.Fatalf("conversation = %#v", m.conversation)
+	}
+}
+
+func TestChatModelCtrlDQuits(t *testing.T) {
+	m := newChatModel(Config{Model: "test-model"}, func(context.Context, Config, []chatMessage, func(string) error) (string, error) {
+		return "", nil
+	})
+
+	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	if _, ok := model.(chatModel); !ok {
+		t.Fatalf("model type = %T", model)
+	}
+	if cmd == nil {
+		t.Fatalf("expected quit command")
+	}
+	if msg := cmd(); msg != tea.Quit() {
+		t.Fatalf("cmd() = %#v", msg)
+	}
+}
+
+func TestChatModelEscCancelsInFlightWithoutQuitting(t *testing.T) {
+	m := newChatModel(Config{Model: "test-model"}, func(context.Context, Config, []chatMessage, func(string) error) (string, error) {
+		return "", nil
+	})
+
+	called := false
+	m.inFlight = true
+	m.cancel = func() {
+		called = true
+	}
+
+	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	next := model.(chatModel)
+
+	if !called {
+		t.Fatalf("expected cancel to be called")
+	}
+	if cmd != nil {
+		t.Fatalf("expected no quit command")
+	}
+	if !next.inFlight {
+		t.Fatalf("expected model to remain in flight until stream finishes")
+	}
+}
+
+func TestChatModelEscRestoresPreviousUserPrompt(t *testing.T) {
+	m := newChatModel(Config{Model: "test-model"}, func(context.Context, Config, []chatMessage, func(string) error) (string, error) {
+		return "", nil
+	})
+	m.conversation = []chatMessage{
+		{Role: "user", Content: "first"},
+		{Role: "assistant", Content: "reply"},
+		{Role: "user", Content: "follow up"},
+	}
+	m.textarea.SetValue("draft")
+
+	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	next := model.(chatModel)
+
+	if cmd != nil {
+		t.Fatalf("expected no command")
+	}
+	if got := next.textarea.Value(); got != "follow up" {
+		t.Fatalf("textarea value = %q", got)
+	}
+}
+
+func TestChatModelCanceledStreamDoesNotShowError(t *testing.T) {
+	m := newChatModel(Config{Model: "test-model"}, func(context.Context, Config, []chatMessage, func(string) error) (string, error) {
+		return "", nil
+	})
+	m.inFlight = true
+	m.errMsg = "old error"
+
+	model, _ := m.Update(streamErrMsg{err: context.Canceled})
+	next := model.(chatModel)
+
+	if next.errMsg != "" {
+		t.Fatalf("errMsg = %q", next.errMsg)
+	}
+	if next.inFlight {
+		t.Fatalf("expected inFlight to be false")
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {

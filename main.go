@@ -404,6 +404,7 @@ func newChatModel(cfg Config, runner streamRunner) chatModel {
 	ta.CharLimit = 0
 	ta.SetHeight(3)
 	ta.ShowLineNumbers = false
+	ta.KeyMap.InsertNewline.SetKeys("alt+enter")
 
 	vp := viewport.New(0, 0)
 	vp.SetContent("")
@@ -418,7 +419,7 @@ func newChatModel(cfg Config, runner streamRunner) chatModel {
 		spinner:      sp,
 		streamRunner: runner,
 		transcript: []transcriptEntry{
-			{role: "assistant", content: "Ready. Type a prompt and press Enter. Use Shift+Enter for a newline."},
+			{role: "assistant", content: "Ready. Type a prompt and press Enter. Use Alt+Enter for a newline."},
 		},
 	}
 	m.refreshViewport()
@@ -435,16 +436,17 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleWindowSize(msg), nil
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "esc":
+		case "ctrl+c", "ctrl+d":
 			if m.cancel != nil {
 				m.cancel()
 			}
 			return m, tea.Quit
-		case "ctrl+l":
-			m.transcript = nil
-			m.errMsg = ""
-			m.refreshViewport()
-			return m, nil
+		case "esc":
+			if m.inFlight && m.cancel != nil {
+				m.cancel()
+				return m, nil
+			}
+			return m.restorePreviousPrompt(), nil
 		case "enter":
 			if m.inFlight {
 				return m, nil
@@ -474,7 +476,11 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.inFlight = false
 		m.cancel = nil
 		m.streamCh = nil
-		m.errMsg = msg.err.Error()
+		if errors.Is(msg.err, context.Canceled) {
+			m.errMsg = ""
+		} else {
+			m.errMsg = msg.err.Error()
+		}
 		m.refreshViewport()
 		return m, nil
 	}
@@ -496,7 +502,7 @@ func (m chatModel) View() string {
 	}
 
 	input := m.textarea.View()
-	help := helpStyle.Render("Enter send • Shift+Enter newline • Ctrl+L clear transcript • Esc quit")
+	help := helpStyle.Render("Enter send • Alt+Enter newline • Esc cancel/edit previous • Ctrl+D quit")
 
 	parts := []string{
 		header,
@@ -562,6 +568,20 @@ func (m chatModel) submitPrompt() (chatModel, tea.Cmd) {
 	m.streamCh = ch
 
 	return m, tea.Batch(m.spinner.Tick, waitForStreamMsg(ch))
+}
+
+func (m chatModel) restorePreviousPrompt() chatModel {
+	for i := len(m.conversation) - 1; i >= 0; i-- {
+		if m.conversation[i].Role != "user" {
+			continue
+		}
+
+		m.textarea.SetValue(m.conversation[i].Content)
+		m.textarea.CursorEnd()
+		return m
+	}
+
+	return m
 }
 
 func (m *chatModel) appendAssistantChunk(chunk string) {
