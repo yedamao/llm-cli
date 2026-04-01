@@ -38,7 +38,7 @@ echo "Summarize this text" | llm-cli
 llm-cli
 ```
 
-Running `llm-cli` with no arguments in a terminal starts an interactive chat loop with line editing and history. Each new prompt includes the earlier conversation, so follow-up questions work as expected.
+Running `llm-cli` with no arguments in a terminal starts a full-screen interactive TUI built with Bubble Tea, Bubbles, and Lip Gloss. The chat transcript stays on screen, responses stream into the viewport live, and each new prompt includes the earlier conversation.
 
 Example:
 
@@ -52,7 +52,7 @@ type Reader interface {
 }
 ```
 
-Press `Ctrl+D` to exit. `Ctrl+C` aborts the current prompt.
+Press `Esc` or `Ctrl+C` to exit. Use `Ctrl+L` to clear the visible transcript.
 
 For OpenAI-compatible providers, `BASE_URL` should point at the provider's `/v1` root. The CLI sends requests to:
 

@@ -3,16 +3,16 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
-)
 
-import "net/http"
+	tea "github.com/charmbracelet/bubbletea"
+)
 
 func TestLoadConfigPrefersEnv(t *testing.T) {
 	home := t.TempDir()
@@ -58,7 +58,10 @@ func TestStreamSSE(t *testing.T) {
 	}, "\n")
 
 	var output strings.Builder
-	if err := streamSSE(strings.NewReader(input), &output); err != nil {
+	if err := streamSSE(strings.NewReader(input), func(chunk string) error {
+		output.WriteString(chunk)
+		return nil
+	}); err != nil {
 		t.Fatalf("streamSSE() error = %v", err)
 	}
 
@@ -119,7 +122,10 @@ func TestStreamChatCompletion(t *testing.T) {
 	var output strings.Builder
 	reply, err := streamChatCompletion(context.Background(), cfg, []chatMessage{
 		{Role: "user", Content: "hello"},
-	}, &output)
+	}, func(chunk string) error {
+		output.WriteString(chunk)
+		return nil
+	})
 	if err != nil {
 		t.Fatalf("streamChatCompletion() error = %v", err)
 	}
@@ -127,7 +133,7 @@ func TestStreamChatCompletion(t *testing.T) {
 	if reply != "Hi there" {
 		t.Fatalf("reply = %q", reply)
 	}
-	if output.String() != "Hi there\n" {
+	if output.String() != "Hi there" {
 		t.Fatalf("output = %q", output.String())
 	}
 }
@@ -138,120 +144,208 @@ func TestShouldStartLoop(t *testing.T) {
 	}
 }
 
-func TestInteractiveLoopMaintainsConversation(t *testing.T) {
-	t.Cleanup(func() {
-		httpClient = http.DefaultClient
+func TestChatModelMaintainsConversation(t *testing.T) {
+	m := newChatModel(Config{Model: "test-model"}, func(context.Context, Config, []chatMessage, func(string) error) (string, error) {
+		return "", nil
 	})
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = model.(chatModel)
 
-	var requests []chatRequest
-	httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("read body: %v", err)
-		}
+	m.textarea.SetValue("hello")
+	model, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = model.(chatModel)
+	model, _ = m.Update(streamChunkMsg{content: "First"})
+	m = model.(chatModel)
+	model, _ = m.Update(streamChunkMsg{content: " reply"})
+	m = model.(chatModel)
+	model, _ = m.Update(streamDoneMsg{reply: "First reply"})
+	m = model.(chatModel)
 
-		var req chatRequest
-		if err := json.Unmarshal(body, &req); err != nil {
-			t.Fatalf("decode request: %v", err)
-		}
-		requests = append(requests, req)
-
-		reply := "First reply"
-		if len(req.Messages) > 1 {
-			reply = "Second reply"
-		}
-
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-			Body: io.NopCloser(strings.NewReader(
-				`data: {"choices":[{"delta":{"content":"` + reply + `"}}]}` + "\n\n" +
-					"data: [DONE]\n\n",
-			)),
-		}, nil
-	})}
-
-	cfg := Config{
-		BaseURL: "https://example.test/v1",
-		APIKey:  "test-key",
-		Model:   "test-model",
+	if got := m.conversation; !reflect.DeepEqual(got, []chatMessage{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: "First reply"},
+	}) {
+		t.Fatalf("conversation after first reply = %#v", got)
 	}
 
-	editor := &fakeLineEditor{
-		prompts: []promptResult{
-			{line: "hello"},
-			{line: "follow up"},
-			{err: io.EOF},
-		},
-	}
+	m.textarea.SetValue("follow up")
+	model, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = model.(chatModel)
+	model, _ = m.Update(streamChunkMsg{content: "Second"})
+	m = model.(chatModel)
+	model, _ = m.Update(streamChunkMsg{content: " reply"})
+	m = model.(chatModel)
+	model, _ = m.Update(streamDoneMsg{reply: "Second reply"})
+	m = model.(chatModel)
 
-	var output strings.Builder
-	if err := interactiveLoop(context.Background(), cfg, editor, &output); err != nil {
-		t.Fatalf("interactiveLoop() error = %v", err)
-	}
-
-	if got, want := editor.history, []string{"hello", "follow up"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("history = %#v, want %#v", got, want)
-	}
-
-	if len(requests) != 2 {
-		t.Fatalf("requests = %d", len(requests))
-	}
-
-	if len(requests[0].Messages) != 1 {
-		t.Fatalf("first request messages = %+v", requests[0].Messages)
-	}
-
-	wantSecond := []chatMessage{
+	wantConversation := []chatMessage{
 		{Role: "user", Content: "hello"},
 		{Role: "assistant", Content: "First reply"},
 		{Role: "user", Content: "follow up"},
+		{Role: "assistant", Content: "Second reply"},
 	}
-	if !reflect.DeepEqual(requests[1].Messages, wantSecond) {
-		t.Fatalf("second request messages = %#v, want %#v", requests[1].Messages, wantSecond)
-	}
-
-	if output.String() != "First reply\nSecond reply\n\n" {
-		t.Fatalf("output = %q", output.String())
-	}
-}
-
-type fakeLineEditor struct {
-	prompts []promptResult
-	history []string
-}
-
-type promptResult struct {
-	line string
-	err  error
-}
-
-func (f *fakeLineEditor) Prompt(string) (string, error) {
-	if len(f.prompts) == 0 {
-		return "", io.EOF
+	if !reflect.DeepEqual(m.conversation, wantConversation) {
+		t.Fatalf("conversation = %#v, want %#v", m.conversation, wantConversation)
 	}
 
-	next := f.prompts[0]
-	f.prompts = f.prompts[1:]
-	return next.line, next.err
-}
-
-func (f *fakeLineEditor) AppendHistory(line string) {
-	f.history = append(f.history, line)
-}
-
-func (f *fakeLineEditor) Close() error {
-	return nil
-}
-
-func TestInteractiveLoopReturnsPromptError(t *testing.T) {
-	editor := &fakeLineEditor{
-		prompts: []promptResult{{err: errors.New("boom")}},
+	if got := m.transcript[len(m.transcript)-1].content; got != "Second reply" {
+		t.Fatalf("final assistant transcript = %q", got)
 	}
 
-	err := interactiveLoop(context.Background(), Config{}, editor, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "read prompt: boom") {
-		t.Fatalf("interactiveLoop() error = %v", err)
+	if !strings.Contains(m.viewport.View(), "Second reply") {
+		t.Fatalf("viewport = %q", m.viewport.View())
+	}
+}
+
+func TestChatModelAltEnterInsertsNewlineWithoutSubmitting(t *testing.T) {
+	m := newChatModel(Config{Model: "test-model"}, func(context.Context, Config, []chatMessage, func(string) error) (string, error) {
+		return "", nil
+	})
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = model.(chatModel)
+
+	m.textarea.SetValue("hello")
+	model, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter, Alt: true})
+	m = model.(chatModel)
+
+	if got := m.textarea.Value(); got != "hello\n" {
+		t.Fatalf("textarea value = %q", got)
+	}
+	if m.inFlight {
+		t.Fatalf("expected prompt not to submit")
+	}
+	if len(m.conversation) != 0 {
+		t.Fatalf("conversation = %#v", m.conversation)
+	}
+}
+
+func TestChatModelCtrlDQuits(t *testing.T) {
+	m := newChatModel(Config{Model: "test-model"}, func(context.Context, Config, []chatMessage, func(string) error) (string, error) {
+		return "", nil
+	})
+
+	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	if _, ok := model.(chatModel); !ok {
+		t.Fatalf("model type = %T", model)
+	}
+	if cmd == nil {
+		t.Fatalf("expected quit command")
+	}
+	if msg := cmd(); msg != tea.Quit() {
+		t.Fatalf("cmd() = %#v", msg)
+	}
+}
+
+func TestChatModelCtrlTTogglesFullScreenTranscript(t *testing.T) {
+	m := newChatModel(Config{Model: "test-model"}, func(context.Context, Config, []chatMessage, func(string) error) (string, error) {
+		return "", nil
+	})
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = model.(chatModel)
+	normalHeight := m.viewport.Height
+
+	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlT})
+	m = model.(chatModel)
+
+	if cmd != nil {
+		t.Fatalf("expected no command")
+	}
+	if !m.fullScreenTranscript {
+		t.Fatalf("expected fullScreenTranscript to be enabled")
+	}
+	if m.viewport.Height <= normalHeight {
+		t.Fatalf("viewport height = %d, want > %d", m.viewport.Height, normalHeight)
+	}
+	if !strings.Contains(m.View(), "Ctrl+T exit transcript") {
+		t.Fatalf("view = %q", m.View())
+	}
+}
+
+func TestChatModelEscCancelsInFlightWithoutQuitting(t *testing.T) {
+	m := newChatModel(Config{Model: "test-model"}, func(context.Context, Config, []chatMessage, func(string) error) (string, error) {
+		return "", nil
+	})
+
+	called := false
+	m.inFlight = true
+	m.cancel = func() {
+		called = true
+	}
+
+	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	next := model.(chatModel)
+
+	if !called {
+		t.Fatalf("expected cancel to be called")
+	}
+	if cmd != nil {
+		t.Fatalf("expected no quit command")
+	}
+	if !next.inFlight {
+		t.Fatalf("expected model to remain in flight until stream finishes")
+	}
+}
+
+func TestChatModelEscRestoresPreviousUserPrompt(t *testing.T) {
+	m := newChatModel(Config{Model: "test-model"}, func(context.Context, Config, []chatMessage, func(string) error) (string, error) {
+		return "", nil
+	})
+	m.conversation = []chatMessage{
+		{Role: "user", Content: "first"},
+		{Role: "assistant", Content: "reply"},
+		{Role: "user", Content: "follow up"},
+	}
+	m.textarea.SetValue("draft")
+
+	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	next := model.(chatModel)
+
+	if cmd != nil {
+		t.Fatalf("expected no command")
+	}
+	if got := next.textarea.Value(); got != "follow up" {
+		t.Fatalf("textarea value = %q", got)
+	}
+}
+
+func TestChatModelCanceledStreamDoesNotShowError(t *testing.T) {
+	m := newChatModel(Config{Model: "test-model"}, func(context.Context, Config, []chatMessage, func(string) error) (string, error) {
+		return "", nil
+	})
+	m.inFlight = true
+	m.errMsg = "old error"
+
+	model, _ := m.Update(streamErrMsg{err: context.Canceled})
+	next := model.(chatModel)
+
+	if next.errMsg != "" {
+		t.Fatalf("errMsg = %q", next.errMsg)
+	}
+	if next.inFlight {
+		t.Fatalf("expected inFlight to be false")
+	}
+}
+
+func TestChatModelFullScreenTranscriptScrollsViewport(t *testing.T) {
+	m := newChatModel(Config{Model: "test-model"}, func(context.Context, Config, []chatMessage, func(string) error) (string, error) {
+		return "", nil
+	})
+
+	for i := 0; i < 40; i++ {
+		m.transcript = append(m.transcript, transcriptEntry{role: "assistant", content: strings.Repeat("line ", 4)})
+	}
+
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 12})
+	m = model.(chatModel)
+	model, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlT})
+	m = model.(chatModel)
+
+	start := m.viewport.YOffset
+	model, _ = m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	m = model.(chatModel)
+
+	if m.viewport.YOffset >= start {
+		t.Fatalf("viewport YOffset = %d, want < %d", m.viewport.YOffset, start)
 	}
 }
 
