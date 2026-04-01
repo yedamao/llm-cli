@@ -86,20 +86,21 @@ type streamErrMsg struct {
 }
 
 type chatModel struct {
-	cfg          Config
-	width        int
-	height       int
-	ready        bool
-	inFlight     bool
-	errMsg       string
-	conversation []chatMessage
-	transcript   []transcriptEntry
-	viewport     viewport.Model
-	textarea     textarea.Model
-	spinner      spinner.Model
-	cancel       context.CancelFunc
-	streamCh     <-chan tea.Msg
-	streamRunner streamRunner
+	cfg                  Config
+	width                int
+	height               int
+	ready                bool
+	inFlight             bool
+	fullScreenTranscript bool
+	errMsg               string
+	conversation         []chatMessage
+	transcript           []transcriptEntry
+	viewport             viewport.Model
+	textarea             textarea.Model
+	spinner              spinner.Model
+	cancel               context.CancelFunc
+	streamCh             <-chan tea.Msg
+	streamRunner         streamRunner
 }
 
 var (
@@ -441,6 +442,8 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cancel()
 			}
 			return m, tea.Quit
+		case "ctrl+t":
+			return m.toggleFullScreenTranscript(), nil
 		case "esc":
 			if m.inFlight && m.cancel != nil {
 				m.cancel()
@@ -448,6 +451,9 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m.restorePreviousPrompt(), nil
 		case "enter":
+			if m.fullScreenTranscript {
+				return m, nil
+			}
 			if m.inFlight {
 				return m, nil
 			}
@@ -485,6 +491,12 @@ func (m chatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if m.fullScreenTranscript {
+		var cmd tea.Cmd
+		m.viewport, cmd = m.viewport.Update(msg)
+		return m, cmd
+	}
+
 	var cmd tea.Cmd
 	m.textarea, cmd = m.textarea.Update(msg)
 	return m, cmd
@@ -499,18 +511,24 @@ func (m chatModel) View() string {
 	status := statusStyle.Render("Model: " + m.cfg.Model)
 	if m.inFlight {
 		status = statusStyle.Render(m.spinner.View() + " Streaming from " + m.cfg.Model)
+	} else if m.fullScreenTranscript {
+		status = statusStyle.Render("Transcript mode • Model: " + m.cfg.Model)
 	}
 
-	input := m.textarea.View()
-	help := helpStyle.Render("Enter send • Alt+Enter newline • Esc cancel/edit previous • Ctrl+D quit")
+	help := helpStyle.Render("Enter send • Alt+Enter newline • Ctrl+T transcript • Esc cancel/edit previous • Ctrl+D quit")
+	if m.fullScreenTranscript {
+		help = helpStyle.Render("Up/Down/PgUp/PgDn scroll • Ctrl+T exit transcript • Esc edit previous • Ctrl+D quit")
+	}
 
 	parts := []string{
 		header,
 		status,
 		m.viewport.View(),
-		input,
-		help,
 	}
+	if !m.fullScreenTranscript {
+		parts = append(parts, m.textarea.View())
+	}
+	parts = append(parts, help)
 	if m.errMsg != "" {
 		parts = append(parts, errorStyle.Render("Error: "+m.errMsg))
 	}
@@ -523,17 +541,24 @@ func (m chatModel) handleWindowSize(msg tea.WindowSizeMsg) chatModel {
 	m.height = msg.Height
 	m.ready = true
 
-	contentWidth := max(20, msg.Width-4)
+	return m.resizeLayout()
+}
+
+func (m chatModel) resizeLayout() chatModel {
+	contentWidth := max(20, m.width-4)
 	headerHeight := 1
 	statusHeight := 1
 	inputHeight := 4
+	if m.fullScreenTranscript {
+		inputHeight = 0
+	}
 	helpHeight := 1
 	errorHeight := 0
 	if m.errMsg != "" {
 		errorHeight = 2
 	}
 
-	viewportHeight := msg.Height - (headerHeight + statusHeight + inputHeight + helpHeight + errorHeight + 4)
+	viewportHeight := m.height - (headerHeight + statusHeight + inputHeight + helpHeight + errorHeight + 4)
 	if viewportHeight < 5 {
 		viewportHeight = 5
 	}
@@ -584,6 +609,14 @@ func (m chatModel) restorePreviousPrompt() chatModel {
 	return m
 }
 
+func (m chatModel) toggleFullScreenTranscript() chatModel {
+	m.fullScreenTranscript = !m.fullScreenTranscript
+	if m.ready {
+		m = m.resizeLayout()
+	}
+	return m
+}
+
 func (m *chatModel) appendAssistantChunk(chunk string) {
 	for i := len(m.transcript) - 1; i >= 0; i-- {
 		if m.transcript[i].role == "assistant" {
@@ -595,6 +628,8 @@ func (m *chatModel) appendAssistantChunk(chunk string) {
 }
 
 func (m *chatModel) refreshViewport() {
+	stickToBottom := !m.fullScreenTranscript || m.viewport.AtBottom()
+
 	var sections []string
 	for _, entry := range m.transcript {
 		if strings.TrimSpace(entry.content) == "" && entry.role == "assistant" && m.inFlight {
@@ -611,7 +646,9 @@ func (m *chatModel) refreshViewport() {
 	}
 
 	m.viewport.SetContent(strings.Join(sections, "\n\n"))
-	m.viewport.GotoBottom()
+	if stickToBottom {
+		m.viewport.GotoBottom()
+	}
 }
 
 func (m chatModel) startStream(ctx context.Context, messages []chatMessage) <-chan tea.Msg {

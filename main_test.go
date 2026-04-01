@@ -236,6 +236,31 @@ func TestChatModelCtrlDQuits(t *testing.T) {
 	}
 }
 
+func TestChatModelCtrlTTogglesFullScreenTranscript(t *testing.T) {
+	m := newChatModel(Config{Model: "test-model"}, func(context.Context, Config, []chatMessage, func(string) error) (string, error) {
+		return "", nil
+	})
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = model.(chatModel)
+	normalHeight := m.viewport.Height
+
+	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlT})
+	m = model.(chatModel)
+
+	if cmd != nil {
+		t.Fatalf("expected no command")
+	}
+	if !m.fullScreenTranscript {
+		t.Fatalf("expected fullScreenTranscript to be enabled")
+	}
+	if m.viewport.Height <= normalHeight {
+		t.Fatalf("viewport height = %d, want > %d", m.viewport.Height, normalHeight)
+	}
+	if !strings.Contains(m.View(), "Ctrl+T exit transcript") {
+		t.Fatalf("view = %q", m.View())
+	}
+}
+
 func TestChatModelEscCancelsInFlightWithoutQuitting(t *testing.T) {
 	m := newChatModel(Config{Model: "test-model"}, func(context.Context, Config, []chatMessage, func(string) error) (string, error) {
 		return "", nil
@@ -298,6 +323,29 @@ func TestChatModelCanceledStreamDoesNotShowError(t *testing.T) {
 	}
 	if next.inFlight {
 		t.Fatalf("expected inFlight to be false")
+	}
+}
+
+func TestChatModelFullScreenTranscriptScrollsViewport(t *testing.T) {
+	m := newChatModel(Config{Model: "test-model"}, func(context.Context, Config, []chatMessage, func(string) error) (string, error) {
+		return "", nil
+	})
+
+	for i := 0; i < 40; i++ {
+		m.transcript = append(m.transcript, transcriptEntry{role: "assistant", content: strings.Repeat("line ", 4)})
+	}
+
+	model, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 12})
+	m = model.(chatModel)
+	model, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlT})
+	m = model.(chatModel)
+
+	start := m.viewport.YOffset
+	model, _ = m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	m = model.(chatModel)
+
+	if m.viewport.YOffset >= start {
+		t.Fatalf("viewport YOffset = %d, want < %d", m.viewport.YOffset, start)
 	}
 }
 
